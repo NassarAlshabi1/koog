@@ -1,0 +1,118 @@
+name: Build and Release Koog Demo APK
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'demo-v*'
+  pull_request:
+    paths:
+      - 'examples/demo-compose-app/**'
+      - '.github/workflows/koog-android-apk-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build Android demo APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: corretto
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android SDK 36
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Assemble release APK
+        working-directory: examples/demo-compose-app
+        run: ./gradlew :androidApp:assembleRelease --no-daemon --stacktrace
+
+      # The demo has no release signingConfig, so sign the APK with a
+      # disposable Android debug key for testing. Do not use this for Play Store.
+      - name: Create temporary debug signing key
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+      - name: Sign and verify APK
+        working-directory: examples/demo-compose-app
+        run: |
+          set -euo pipefail
+          input_apk="$(find androidApp/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$input_apk"
+          mkdir -p dist
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign \
+            --ks "$HOME/.android/debug.keystore" \
+            --ks-key-alias androiddebugkey \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out dist/koog-demo.apk \
+            "$input_apk"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose dist/koog-demo.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: koog-demo-android-apk
+          path: examples/demo-compose-app/dist/koog-demo.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Attach APK to GitHub Release
+    needs: build-apk
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/demo-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: koog-demo-android-apk
+          path: dist
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          apk="$(find dist -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$apk"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "$apk" --clobber
+          else
+            gh release create "$TAG_NAME" "$apk" \
+              --title "Koog Demo Android $TAG_NAME" \
+              --generate-notes
+          fi
